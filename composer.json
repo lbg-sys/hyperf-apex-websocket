@@ -1,0 +1,43 @@
+{
+    "name": "hyperf-apex/websocket",
+    "description": "Apex WebSocket gateway and push service for Hyperf",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": [
+        "hyperf",
+        "swoole",
+        "apex",
+        "websocket",
+        "push"
+    ],
+    "homepage": "https://github.com/lbg-sys/hyperf-apex-websocket",
+    "support": {
+        "issues": "https://github.com/lbg-sys/hyperf-apex-websocket/issues",
+        "source": "https://github.com/lbg-sys/hyperf-apex-websocket"
+    },
+    "authors": [
+        {
+            "name": "lbg-sys",
+            "homepage": "https://github.com/lbg-sys"
+        }
+    ],
+    "require": {
+        "php": ">=8.4",
+        "hyperf-apex/core": "^1.0",
+        "hyperf/websocket-server": "^3.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "Hyperf\\Apex\\WebSocket\\": "src/"
+        }
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-master": "1.0.x-dev",
+            "dev-main": "1.0.x-dev"
+        },
+        "hyperf": {
+            "config": "Hyperf\\Apex\\WebSocket\\ConfigProvider"
+        }
+    }
+}
