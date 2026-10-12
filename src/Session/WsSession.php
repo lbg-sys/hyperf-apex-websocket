@@ -45,6 +45,23 @@ final class WsSession
     }
 
     /**
+     * 从连接 id 取 fd：id 形如 `{server}:{fd}`，fd 一定在最后一个冒号之后。
+     *
+     * 取不到时返回 0，调用方据此认定这条索引已经坏了（推送与回收都要做这个判断，所以编解码放在一处）。
+     */
+    public static function fdOf(string $connectionId): int
+    {
+        $position = strrpos($connectionId, ':');
+        if ($position === false) {
+            return 0;
+        }
+
+        $fd = substr($connectionId, $position + 1);
+
+        return ctype_digit($fd) ? (int) $fd : 0;
+    }
+
+    /**
      * 写入当前连接的连接级 Context。
      */
     public function store(): void

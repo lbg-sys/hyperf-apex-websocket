@@ -53,7 +53,10 @@ final readonly class WsEnvelopeDTO implements Arrayable, Jsonable, JsonSerializa
         }
 
         $data = $raw['data'] ?? [];
-        if (! is_array($data)) {
+        // JSON 数组与 JSON 对象解码后都是 PHP 数组，靠 array_is_list 区分：形状校验在这里做完，
+        // 否则 `"data": [1,2]` 会一路走到 payload 水合，报出来的错与真实原因完全不相干。
+        // 空数组例外：`{}` 与 `[]` 在解码后无法区分，只能都当作「没有数据」放行。
+        if (! is_array($data) || ($data !== [] && array_is_list($data))) {
             throw new BusinessException(ErrorCode::INVALID_ARGUMENT, '消息 data 必须是 JSON 对象。');
         }
 

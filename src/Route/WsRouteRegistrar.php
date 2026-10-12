@@ -41,6 +41,9 @@ final class WsRouteRegistrar
     }
 
     /**
+     * 返回值是「本次已装好的路由」清单（server 名 => 该 server 下的 path），
+     * 供调用方记启动日志与测试断言使用；注册本身不依赖它。
+     *
      * @return array<string, list<string>> server 名 => 该 server 下已注册的 path
      */
     public function register(): array

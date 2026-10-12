@@ -21,6 +21,11 @@ use Throwable;
  *
  * 表必须在 BeforeMainServerStart（master 进程、fork 之前）创建，否则每个 worker 各建各的，
  * 表之间不共享。
+ *
+ * 并发口径：用户索引与房间索引都是「一行放一串连接 id」，读改写不是原子的（Swoole\Table
+ * 没有行锁）。单 worker 下协程不会在这两步之间切换，因此是安全的；跨 worker 并发注册同一
+ * 用户时才存在丢 id 的窗口 —— 网关强制单 worker（Sender 在协程服务器下也无法跨 worker 投递），
+ * 该前提由 WsRuntimeCheckListener 在启动期守住。
  */
 final class WsConnectionStore implements WsConnectionStoreInterface
 {
@@ -82,6 +87,7 @@ final class WsConnectionStore implements WsConnectionStoreInterface
             'user_id' => $principal->userId ?? 0,
             'session_id' => $principal->sessionId ?? '',
             'connected_at' => $session->connectedAt,
+            'last_active_at' => $session->connectedAt,
         ]);
 
         if ($principal === null) {
@@ -122,6 +128,42 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         }
 
         self::connections()->del($connectionId);
+    }
+
+    public function hasConnection(string $connectionId): bool
+    {
+        return is_array(self::connections()->get($connectionId));
+    }
+
+    public function touch(string $connectionId, int $activeAt): void
+    {
+        // 只写一列：Swoole\Table::set 对已存在的行是部分更新，不会覆盖其余列。
+        // 行已经不存在时 set 会新建一行残行，所以先确认连接还在。
+        if (! is_array(self::connections()->get($connectionId))) {
+            return;
+        }
+
+        self::connections()->set($connectionId, ['last_active_at' => $activeAt]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function idleConnections(int $idleBefore): array
+    {
+        $ids = [];
+        foreach (self::connections() as $key => $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            // 缺列（老表结构残留）按 0 处理：宁可多回收一次，也不要留下永远不回收的连接。
+            if ((int) ($row['last_active_at'] ?? 0) < $idleBefore) {
+                $ids[] = (string) $key;
+            }
+        }
+
+        return $ids;
     }
 
     public function connectionsByUser(string $userType, int $userId): array
@@ -199,6 +241,7 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         $table->column('user_id', Table::TYPE_INT);
         $table->column('session_id', Table::TYPE_STRING, self::SESSION_ID_BYTES);
         $table->column('connected_at', Table::TYPE_INT);
+        $table->column('last_active_at', Table::TYPE_INT);
         if (! $table->create()) {
             throw new RuntimeException('无法创建 WebSocket 连接索引表 ws_conn。');
         }

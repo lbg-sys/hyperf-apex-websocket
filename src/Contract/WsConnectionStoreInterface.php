@@ -15,6 +15,11 @@ use Hyperf\Apex\WebSocket\Session\WsSession;
  *
  * 连接 id 统一是 `{server}:{fd}`：不同 server 的 fd 编号空间独立，
  * 带 server 维度能以几乎为零的成本把多 server 的 fd 冲突一次堵掉。
+ *
+ * 实现被要求是「单 worker 内安全」的：连接索引的读改写不是原子的
+ * （Swoole\Table 没有行锁），跨 worker 并发注册同一用户时存在丢索引的窗口。
+ * 协程服务器下 Sender 本来就无法跨 worker 投递，所以网关强制单 worker，
+ * 该前提由 WsRuntimeCheckListener 在启动期守住。
  */
 interface WsConnectionStoreInterface
 {
@@ -30,6 +35,28 @@ interface WsConnectionStoreInterface
      * 由入口在 onClose 里按 rooms() 逐个 leaveRoom()，才能精确退订。
      */
     public function unregister(string $connectionId): void;
+
+    /**
+     * 连接是否仍在索引里。
+     *
+     * 房间成员列表与连接行是两份数据，连接行已经没了而房间行还挂着时，
+     * 推送侧靠它把失效成员剔出去（见 WsPushService::pushToRoom）。
+     */
+    public function hasConnection(string $connectionId): bool;
+
+    /**
+     * 刷新连接的活跃时间：任何一条入站消息都算活跃。
+     *
+     * 空闲回收的唯一判据，因此 onMessage 每条消息都会调一次（共享内存写，无 IO）。
+     */
+    public function touch(string $connectionId, int $activeAt): void;
+
+    /**
+     * 活跃时间早于 $idleBefore 的连接 id（跨 worker 汇总），供空闲连接回收使用。
+     *
+     * @return list<string>
+     */
+    public function idleConnections(int $idleBefore): array;
 
     /**
      * @return list<string>

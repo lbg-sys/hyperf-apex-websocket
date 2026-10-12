@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Hyperf\Apex\WebSocket\Controller;
 
 use Hyperf\Apex\Enum\ErrorCode;
+use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\WebSocket\Auth\WsHandshakeContext;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Protocol\WsBuiltinEvent;
 use Hyperf\Apex\WebSocket\Protocol\WsResponseDTO;
+use Hyperf\Apex\WebSocket\RateLimit\WsConnectionRateLimiter;
 use Hyperf\Apex\WebSocket\Registry\WsGatewayScanner;
 use Hyperf\Apex\WebSocket\Service\WsDispatcher;
 use Hyperf\Apex\WebSocket\Session\WsSession;
@@ -41,11 +43,12 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
         private readonly WsGatewayScanner $gateways,
         private readonly WsDispatcher $dispatcher,
         private readonly WsConnectionStoreInterface $store,
+        private readonly WsConnectionRateLimiter $rateLimiter,
         private readonly Sender $sender,
         private readonly ConfigInterface $config,
         LoggerFactory $loggerFactory,
     ) {
-        $this->logger = $loggerFactory->get('websocket', 'error');
+        $this->logger = LoggerChannels::resolve($loggerFactory, 'websocket', 'error');
     }
 
     /**
@@ -112,6 +115,22 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
         }
 
         $payload = (string) ($frame->data ?? '');
+        // 二进制帧（opcode 2）不是本协议的一部分：直接拒绝比丢给 JSON 解析报「不是合法 JSON」更准确。
+        // ping/pong 帧由 Swoole 内部处理，不会进 onMessage；close 帧默认也不进来。
+        if (($frame->opcode ?? WEBSOCKET_OPCODE_TEXT) !== WEBSOCKET_OPCODE_TEXT) {
+            $this->respond($fd, WsResponseDTO::error(
+                '',
+                WsBuiltinEvent::ERROR->value,
+                ErrorCode::INVALID_ARGUMENT,
+                '只接受文本帧（JSON）消息。',
+            ));
+
+            return;
+        }
+
+        // 收到消息即算活跃：空闲回收（WsIdleConnectionRecycleListener）据此判断连接是不是还活着。
+        $this->store->touch($session->id(), time());
+
         $maxBytes = (int) $this->config->get('websocket.max_frame_bytes', 65536);
         if ($maxBytes > 0 && strlen($payload) > $maxBytes) {
             $this->respond($fd, WsResponseDTO::error(
@@ -136,6 +155,8 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
                 $this->store->leaveRoom($session->id(), $room);
             }
             $this->store->unregister($session->id());
+            // 限流状态按连接 id 存进程内存：不在这里清掉，已关闭连接的条目会一直留着。
+            $this->rateLimiter->forget($session->id());
         }
 
         // 三处都要清。FdCollector 与连接级 Context 框架也会在 onClose 的 defer 里清一次，
@@ -146,6 +167,8 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
 
     private function respond(int $fd, WsResponseDTO $response): void
     {
+        // 返回值只在协程服务器下可信（传统 Server 的 Sender 恒定返回 true），所以这里只记日志：
+        // 投递失败是运维信息，不是业务判断依据（详见 WsPushService 的类注释）。
         if (! $this->sender->push($fd, $response->toJson())) {
             $this->logger->warning(sprintf('WebSocket 响应投递失败，fd=%d。', $fd));
         }

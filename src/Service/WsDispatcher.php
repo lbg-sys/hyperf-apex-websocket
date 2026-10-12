@@ -8,6 +8,7 @@ use Hyperf\Apex\DTO\AbstractDTO;
 use Hyperf\Apex\Enum\ErrorCode;
 use Hyperf\Apex\Exception\BusinessException;
 use Hyperf\Apex\Http\ArgumentResolver\RequestDataHydrator;
+use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\Security\Contract\PrincipalContextInterface;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Definition\WsRouteDefinition;
@@ -15,6 +16,7 @@ use Hyperf\Apex\WebSocket\DTO\WsSubscriptionResultDTO;
 use Hyperf\Apex\WebSocket\Protocol\WsBuiltinEvent;
 use Hyperf\Apex\WebSocket\Protocol\WsEnvelopeDTO;
 use Hyperf\Apex\WebSocket\Protocol\WsResponseDTO;
+use Hyperf\Apex\WebSocket\RateLimit\WsConnectionRateLimiter;
 use Hyperf\Apex\WebSocket\Registry\WsHandlerRegistry;
 use Hyperf\Apex\WebSocket\Session\WsRequestContext;
 use Hyperf\Apex\WebSocket\Session\WsSession;
@@ -32,6 +34,7 @@ use Throwable;
  *
  * 唯一的硬约束：**任何业务异常都不得断开连接**。协议级错误（无法解析 JSON、缺少 event、
  * 未知 event）同样只回错误信封，由客户端决定是否重连 —— 断连的代价远高于一次错误响应。
+ * 频率超限同理：回错误信封，不断连。
  */
 final class WsDispatcher
 {
@@ -49,13 +52,25 @@ final class WsDispatcher
         private readonly PrincipalContextInterface $principalContext,
         private readonly ContainerInterface $container,
         private readonly ConfigInterface $config,
+        private readonly WsConnectionRateLimiter $rateLimiter,
         LoggerFactory $loggerFactory,
     ) {
-        $this->logger = $loggerFactory->get('websocket', 'error');
+        $this->logger = LoggerChannels::resolve($loggerFactory, 'websocket', 'error');
     }
 
     public function dispatch(WsSession $session, string $raw): WsResponseDTO
     {
+        // 限流放在最前面：它要挡的正是「大量消息」这件事本身，解析 JSON 也是要被挡下的成本之一。
+        // 超限只回错误信封，不断开连接（与其它错误一致）——重连解决不了刷消息。
+        if (! $this->rateLimiter->allow($session->id(), time())) {
+            return WsResponseDTO::error(
+                '',
+                WsBuiltinEvent::ERROR->value,
+                ErrorCode::TOO_MANY_REQUESTS,
+                $this->rateLimiter->message(),
+            );
+        }
+
         try {
             /** @var mixed $decoded */
             $decoded = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
