@@ -80,7 +80,6 @@ final class WsConnectionStore implements WsConnectionStoreInterface
             'endpoint' => $session->endpoint,
             'user_type' => $principal->userType ?? '',
             'user_id' => $principal->userId ?? 0,
-            'tenant_id' => $principal->tenantId ?? 0,
             'session_id' => $principal->sessionId ?? '',
             'connected_at' => $session->connectedAt,
         ]);
@@ -198,7 +197,6 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         $table->column('endpoint', Table::TYPE_STRING, self::ENDPOINT_BYTES);
         $table->column('user_type', Table::TYPE_STRING, self::USER_TYPE_BYTES);
         $table->column('user_id', Table::TYPE_INT);
-        $table->column('tenant_id', Table::TYPE_INT);
         $table->column('session_id', Table::TYPE_STRING, self::SESSION_ID_BYTES);
         $table->column('connected_at', Table::TYPE_INT);
         if (! $table->create()) {
