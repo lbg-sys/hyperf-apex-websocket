@@ -10,6 +10,7 @@ use Hyperf\Apex\Exception\BusinessException;
 use Hyperf\Apex\Http\ArgumentResolver\RequestDataHydrator;
 use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\Security\Contract\PrincipalContextInterface;
+use Hyperf\Apex\Support\Time;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Definition\WsRouteDefinition;
 use Hyperf\Apex\WebSocket\DTO\WsSubscriptionResultDTO;
@@ -62,7 +63,7 @@ final class WsDispatcher
     {
         // 限流放在最前面：它要挡的正是「大量消息」这件事本身，解析 JSON 也是要被挡下的成本之一。
         // 超限只回错误信封，不断开连接（与其它错误一致）——重连解决不了刷消息。
-        if (! $this->rateLimiter->allow($session->id(), time())) {
+        if (! $this->rateLimiter->allow($session->id(), Time::now()->getTimestamp())) {
             return WsResponseDTO::error(
                 '',
                 WsBuiltinEvent::ERROR->value,

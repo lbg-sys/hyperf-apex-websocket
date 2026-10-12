@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Hyperf\Apex\WebSocket\Listener;
 
 use Hyperf\Apex\Logging\LoggerChannels;
+use Hyperf\Apex\Support\Time;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Session\WsSession;
 use Hyperf\Contract\ConfigInterface;
@@ -75,7 +76,7 @@ final class WsIdleConnectionRecycleListener implements ListenerInterface
 
     private function recycle(int $timeout): void
     {
-        $idleBefore = time() - $timeout;
+        $idleBefore = Time::now()->getTimestamp() - $timeout;
 
         foreach ($this->store->idleConnections($idleBefore) as $connectionId) {
             $fd = WsSession::fdOf($connectionId);

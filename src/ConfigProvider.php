@@ -47,7 +47,7 @@ class ConfigProvider
             'publish' => [
                 [
                     'id' => 'config',
-                    'description' => 'The configuration files for apex websocket gateway.',
+                    'description' => 'apex websocket 网关的配置模板。',
                     'source' => __DIR__ . '/../publish/',
                     'destination' => BASE_PATH . '/config/autoload/',
                 ],

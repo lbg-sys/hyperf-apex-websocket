@@ -6,6 +6,7 @@ namespace Hyperf\Apex\WebSocket\Controller;
 
 use Hyperf\Apex\Enum\ErrorCode;
 use Hyperf\Apex\Logging\LoggerChannels;
+use Hyperf\Apex\Support\Time;
 use Hyperf\Apex\WebSocket\Auth\WsHandshakeContext;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Protocol\WsBuiltinEvent;
@@ -88,7 +89,7 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
             $fd,
             $definition->endpoint,
             WsHandshakeContext::principal(),
-            time(),
+            Time::now()->getTimestamp(),
         );
         $session->store();
 
@@ -129,7 +130,7 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
         }
 
         // 收到消息即算活跃：空闲回收（WsIdleConnectionRecycleListener）据此判断连接是不是还活着。
-        $this->store->touch($session->id(), time());
+        $this->store->touch($session->id(), Time::now()->getTimestamp());
 
         $maxBytes = (int) $this->config->get('websocket.max_frame_bytes', 65536);
         if ($maxBytes > 0 && strlen($payload) > $maxBytes) {
