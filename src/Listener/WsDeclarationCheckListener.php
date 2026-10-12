@@ -42,7 +42,7 @@ final class WsDeclarationCheckListener implements ListenerInterface
 
     public function process(object $event): void
     {
-        if (! (bool) $this->config->get('websocket.enabled', true)) {
+        if (! (bool) $this->config->get('websocket.enabled')) {
             return;
         }
 
@@ -55,8 +55,42 @@ final class WsDeclarationCheckListener implements ListenerInterface
             }
         }
 
+        $errors = [...$errors, ...$this->checkGatewayPresence()];
+
         if ($errors !== []) {
             throw new RuntimeException("WebSocket 声明检查失败：\n - " . implode("\n - ", $errors));
         }
+    }
+
+    /**
+     * 「配了 WebSocket 服务却一个入口都没有」必须在启动期炸：客户端握手只会拿到 404，
+     * 而从「启动日志一切正常」到「握手 404」之间没有任何线索。
+     *
+     * 反过来，「没有入口」本身不是错误：monorepo 的元包会一并装上本包，一个只用 HTTP 的
+     * 应用（server.php 里没有 WebSocket 服务）不该因为装了这个包就起不来。
+     *
+     * @return list<string>
+     */
+    private function checkGatewayPresence(): array
+    {
+        try {
+            if ($this->gateways->all() !== []) {
+                return [];
+            }
+        } catch (WsDeclarationException) {
+            // 声明本身就有错，错误已经在上面收集过了，这里不重复报一遍。
+            return [];
+        }
+
+        $servers = $this->gateways->webSocketServers();
+        if ($servers === []) {
+            return [];
+        }
+
+        return [sprintf(
+            'config/autoload/server.php 声明了 WebSocket 服务（%s），但没有任何 #[WsGateway] 入口：'
+            . '客户端握手只会拿到 404。请补一个入口，或把 websocket.enabled 设为 false。',
+            implode(', ', $servers),
+        )];
     }
 }

@@ -9,6 +9,7 @@ use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\Support\Time;
 use Hyperf\Apex\WebSocket\Auth\WsHandshakeContext;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
+use Hyperf\Apex\WebSocket\Contract\WsRoomStoreInterface;
 use Hyperf\Apex\WebSocket\Protocol\WsBuiltinEvent;
 use Hyperf\Apex\WebSocket\Protocol\WsResponseDTO;
 use Hyperf\Apex\WebSocket\RateLimit\WsConnectionRateLimiter;
@@ -44,6 +45,7 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
         private readonly WsGatewayScanner $gateways,
         private readonly WsDispatcher $dispatcher,
         private readonly WsConnectionStoreInterface $store,
+        private readonly WsRoomStoreInterface $roomStore,
         private readonly WsConnectionRateLimiter $rateLimiter,
         private readonly Sender $sender,
         private readonly ConfigInterface $config,
@@ -91,6 +93,9 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
             WsHandshakeContext::principal(),
             Time::now()->getTimestamp(),
         );
+        // 身份中转只活到「组装会话」这一刻：不清掉的话它会一直挂在连接级 Context 里，
+        // 而连接的身份已经由 WsSession 承载，中转值是纯粹的残留。
+        WsHandshakeContext::clear();
         $session->store();
 
         try {
@@ -132,7 +137,7 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
         // 收到消息即算活跃：空闲回收（WsIdleConnectionRecycleListener）据此判断连接是不是还活着。
         $this->store->touch($session->id(), Time::now()->getTimestamp());
 
-        $maxBytes = (int) $this->config->get('websocket.max_frame_bytes', 65536);
+        $maxBytes = (int) $this->config->get('websocket.max_frame_bytes');
         if ($maxBytes > 0 && strlen($payload) > $maxBytes) {
             $this->respond($fd, WsResponseDTO::error(
                 '',
@@ -151,9 +156,9 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
     {
         $session = WsSession::find($fd);
         if ($session !== null) {
-            // 按会话记录的 rooms 精确退订：只清连接行会让房间表里留下永远清不掉的脏 fd。
+            // 按会话记录的 rooms 精确退订：只清连接行会让房间索引里留下永远清不掉的脏 fd。
             foreach ($session->rooms() as $room) {
-                $this->store->leaveRoom($session->id(), $room);
+                $this->roomStore->leaveRoom($session->id(), $room);
             }
             $this->store->unregister($session->id());
             // 限流状态按连接 id 存进程内存：不在这里清掉，已关闭连接的条目会一直留着。
@@ -180,7 +185,11 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
      *
      * 优先取 Swoole 握手请求自带的 fd：onOpen 所在的回调形态由框架决定
      * （协程服务器走 wait、经典 Swoole\WebSocket\Server 走 defer），
-     * 只有握手请求本身是两种形态都带着的可靠来源。退化路径才读协程 Context。
+     * 只有握手请求本身是两种形态都带着的可靠来源。
+     *
+     * 退化路径读的是**协程** Context 而不是连接级 Context：框架是在调用 onOpen 之前
+     * `Context::set(WsContext::FD, $fd)`（协程级），而连接级 Context 的 `ws.fd` 这一格
+     * 全仓库没有人写过 —— 读它只会恒得 0，把「拿不到 fd」变成「静默不建会话」。
      */
     private function resolveFd(mixed $request): int
     {
@@ -188,6 +197,6 @@ abstract class WsGatewayController implements OnCloseInterface, OnMessageInterfa
             return (int) $request->fd;
         }
 
-        return (int) ConnectionContext::get(ConnectionContext::FD, 0);
+        return (int) CoContext::get(ConnectionContext::FD, 0);
     }
 }

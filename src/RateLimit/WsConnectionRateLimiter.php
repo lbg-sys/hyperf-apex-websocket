@@ -22,8 +22,16 @@ final class WsConnectionRateLimiter
     /** @var array<string, array{window: int, count: int}> */
     private array $windows = [];
 
-    public function __construct(private readonly ConfigInterface $config)
+    private readonly int $windowSeconds;
+
+    private readonly int $maxMessages;
+
+    public function __construct(ConfigInterface $config)
     {
+        // 配置在进程生命周期内不会变，而这条路径每条消息都要走：把两次 config->get()
+        // （内部是 explode + 逐层取值）从热路径提前到构造期。
+        $this->windowSeconds = (int) $config->get('websocket.rate_limit.window_seconds');
+        $this->maxMessages = (int) $config->get('websocket.rate_limit.max_messages');
     }
 
     /**
@@ -33,13 +41,11 @@ final class WsConnectionRateLimiter
      */
     public function allow(string $connectionId, int $now): bool
     {
-        $windowSeconds = $this->windowSeconds();
-        $maxMessages = $this->maxMessages();
-        if ($windowSeconds <= 0 || $maxMessages <= 0) {
+        if ($this->windowSeconds <= 0 || $this->maxMessages <= 0) {
             return true;
         }
 
-        $window = intdiv($now, $windowSeconds);
+        $window = intdiv($now, $this->windowSeconds);
         $state = $this->windows[$connectionId] ?? null;
         if ($state === null || $state['window'] !== $window) {
             $this->windows[$connectionId] = ['window' => $window, 'count' => 1];
@@ -47,7 +53,7 @@ final class WsConnectionRateLimiter
             return true;
         }
 
-        if ($state['count'] >= $maxMessages) {
+        if ($state['count'] >= $this->maxMessages) {
             return false;
         }
 
@@ -66,16 +72,6 @@ final class WsConnectionRateLimiter
      */
     public function message(): string
     {
-        return sprintf('消息发送过于频繁：每 %d 秒最多 %d 条。', $this->windowSeconds(), $this->maxMessages());
-    }
-
-    private function windowSeconds(): int
-    {
-        return (int) $this->config->get('websocket.rate_limit.window_seconds', 1);
-    }
-
-    private function maxMessages(): int
-    {
-        return (int) $this->config->get('websocket.rate_limit.max_messages', 50);
+        return sprintf('消息发送过于频繁：每 %d 秒最多 %d 条。', $this->windowSeconds, $this->maxMessages);
     }
 }

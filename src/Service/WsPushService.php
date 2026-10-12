@@ -8,6 +8,7 @@ use Hyperf\Apex\DTO\AbstractDTO;
 use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Contract\WsPusherInterface;
+use Hyperf\Apex\WebSocket\Contract\WsRoomStoreInterface;
 use Hyperf\Apex\WebSocket\Protocol\WsPushDTO;
 use Hyperf\Apex\WebSocket\Session\WsSession;
 use Hyperf\Logger\LoggerFactory;
@@ -34,6 +35,7 @@ final class WsPushService implements WsPusherInterface
 
     public function __construct(
         private readonly WsConnectionStoreInterface $store,
+        private readonly WsRoomStoreInterface $roomStore,
         private readonly Sender $sender,
         LoggerFactory $loggerFactory,
     ) {
@@ -47,7 +49,19 @@ final class WsPushService implements WsPusherInterface
 
     public function pushToRoom(string $room, string $event, AbstractDTO $payload): void
     {
-        $this->pushTo($this->pruneRoom($room), $event, $payload);
+        // 惰性自愈与投递合成一趟：房间行只在 onClose 里摘（unregister 不知道连接持有哪几个房间），
+        // 连接行先消失的窗口里失效 id 会一直挂着，每次推房间都白投一次。判活成本是 O(成员数)
+        // 次共享内存读，跑在本来就要遍历成员的推送路径上，不额外增加量级。
+        $message = null;
+        foreach ($this->roomStore->connectionsByRoom($room) as $connectionId) {
+            if (! $this->store->hasConnection($connectionId)) {
+                $this->roomStore->leaveRoom($connectionId, $room);
+                continue;
+            }
+
+            $message ??= WsPushDTO::make($event, $payload)->toJson();
+            $this->deliver($connectionId, $event, $message);
+        }
     }
 
     public function pushToEndpoint(string $endpoint, string $event, AbstractDTO $payload): void
@@ -61,30 +75,6 @@ final class WsPushService implements WsPusherInterface
     }
 
     /**
-     * 房间成员里已经失效的连接顺手退订。
-     *
-     * 房间行只在 onClose 里摘（unregister 不知道连接持有哪几个房间），连接行先消失的窗口里
-     * 失效 id 会一直挂着，每次推房间都白投一次。这里做惰性自愈：成本是 O(成员数) 次共享内存读，
-     * 跑在本来就要遍历成员的推送路径上，不额外增加量级。
-     *
-     * @return list<string>
-     */
-    private function pruneRoom(string $room): array
-    {
-        $alive = [];
-        foreach ($this->store->connectionsByRoom($room) as $connectionId) {
-            if ($this->store->hasConnection($connectionId)) {
-                $alive[] = $connectionId;
-                continue;
-            }
-
-            $this->store->leaveRoom($connectionId, $room);
-        }
-
-        return $alive;
-    }
-
-    /**
      * @param list<string> $connectionIds
      */
     private function pushTo(array $connectionIds, string $event, AbstractDTO $payload): void
@@ -93,23 +83,29 @@ final class WsPushService implements WsPusherInterface
             return;
         }
 
+        // 信封只编一次：同一个事件推给 N 条连接，编 N 次纯属浪费。
         $message = WsPushDTO::make($event, $payload)->toJson();
 
         foreach ($connectionIds as $connectionId) {
-            $fd = WsSession::fdOf($connectionId);
-            if ($fd <= 0) {
-                // 连接 id 自身不可解析说明索引已经坏了；它不指向任何在线连接，摘掉是安全的。
-                $this->store->unregister($connectionId);
-                continue;
-            }
+            $this->deliver($connectionId, $event, $message);
+        }
+    }
 
-            if (! $this->sender->push($fd, $message)) {
-                // 只记日志、不摘索引：见类注释，false 不等于「连接已死」。
-                $this->logger->warning('WebSocket 推送投递失败。', [
-                    'connection' => $connectionId,
-                    'event' => $event,
-                ]);
-            }
+    private function deliver(string $connectionId, string $event, string $message): void
+    {
+        $fd = WsSession::fdOf($connectionId);
+        if ($fd <= 0) {
+            // 连接 id 自身不可解析说明索引已经坏了；它不指向任何在线连接，摘掉是安全的。
+            $this->store->unregister($connectionId);
+            return;
+        }
+
+        if (! $this->sender->push($fd, $message)) {
+            // 只记日志、不摘索引：见类注释，false 不等于「连接已死」。
+            $this->logger->warning('WebSocket 推送投递失败。', [
+                'connection' => $connectionId,
+                'event' => $event,
+            ]);
         }
     }
 }

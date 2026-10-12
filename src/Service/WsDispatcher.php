@@ -12,6 +12,7 @@ use Hyperf\Apex\Logging\LoggerChannels;
 use Hyperf\Apex\Security\Contract\PrincipalContextInterface;
 use Hyperf\Apex\Support\Time;
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
+use Hyperf\Apex\WebSocket\Contract\WsRoomStoreInterface;
 use Hyperf\Apex\WebSocket\Definition\WsRouteDefinition;
 use Hyperf\Apex\WebSocket\DTO\WsSubscriptionResultDTO;
 use Hyperf\Apex\WebSocket\Protocol\WsBuiltinEvent;
@@ -21,6 +22,7 @@ use Hyperf\Apex\WebSocket\RateLimit\WsConnectionRateLimiter;
 use Hyperf\Apex\WebSocket\Registry\WsHandlerRegistry;
 use Hyperf\Apex\WebSocket\Session\WsRequestContext;
 use Hyperf\Apex\WebSocket\Session\WsSession;
+use Hyperf\Apex\WebSocket\Support\RoomName;
 use Hyperf\Contract\ConfigInterface;
 use Hyperf\Database\Model\ModelNotFoundException;
 use Hyperf\Logger\LoggerFactory;
@@ -28,6 +30,7 @@ use Hyperf\Validation\ValidationException;
 use JsonException;
 use Psr\Container\ContainerInterface;
 use Psr\Log\LoggerInterface;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -39,16 +42,12 @@ use Throwable;
  */
 final class WsDispatcher
 {
-    /**
-     * 房间名：1-64 位字母、数字与 _ . : -，避免把任意用户输入塞进共享内存的键。
-     */
-    private const ROOM_PATTERN = '/^[A-Za-z0-9_.:-]{1,64}$/';
-
     private readonly LoggerInterface $logger;
 
     public function __construct(
         private readonly WsHandlerRegistry $handlers,
         private readonly WsConnectionStoreInterface $store,
+        private readonly WsRoomStoreInterface $roomStore,
         private readonly RequestDataHydrator $hydrator,
         private readonly PrincipalContextInterface $principalContext,
         private readonly ContainerInterface $container,
@@ -142,13 +141,20 @@ final class WsDispatcher
     private function subscribe(WsSession $session, WsEnvelopeDTO $envelope, string $id): WsResponseDTO
     {
         $room = $this->room($envelope);
-        $maxRooms = max(1, (int) $this->config->get('websocket.max_rooms_per_connection', 20));
+        $maxRooms = max(1, (int) $this->config->get('websocket.max_rooms_per_connection'));
+        $connectionId = $session->id();
+
+        // 房间索引不认识连接索引，所以这里补上跨索引的前提：连接行已经没了还给房间加成员，
+        // 等于往成员列表里塞一个「没人认识、onClose 也摘不掉」的 id。
+        if (! $this->store->hasConnection($connectionId)) {
+            throw new RuntimeException(sprintf('连接 %s 未注册，无法加入房间 %s。', $connectionId, $room));
+        }
 
         if (! $session->inRoom($room) && count($session->rooms()) >= $maxRooms) {
             throw new BusinessException(ErrorCode::RESOURCE_CONFLICT, sprintf('单个连接最多订阅 %d 个房间。', $maxRooms));
         }
 
-        if (! $this->store->joinRoom($session->id(), $room)) {
+        if (! $this->roomStore->joinRoom($connectionId, $room)) {
             throw new BusinessException(ErrorCode::RESOURCE_CONFLICT, sprintf('房间 %s 的成员已达上限。', $room));
         }
 
@@ -160,7 +166,7 @@ final class WsDispatcher
     private function unsubscribe(WsSession $session, WsEnvelopeDTO $envelope, string $id): WsResponseDTO
     {
         $room = $this->room($envelope);
-        $this->store->leaveRoom($session->id(), $room);
+        $this->roomStore->leaveRoom($session->id(), $room);
         $session->leaveRoom($room);
 
         return WsResponseDTO::success($id, $envelope->event, new WsSubscriptionResultDTO($room, $session->rooms()));
@@ -211,8 +217,10 @@ final class WsDispatcher
     private function room(WsEnvelopeDTO $envelope): string
     {
         $room = $envelope->data['room'] ?? null;
-        if (! is_string($room) || preg_match(self::ROOM_PATTERN, $room) !== 1) {
-            throw new BusinessException(ErrorCode::INVALID_ARGUMENT, '房间名必须是 1-64 位的字母、数字或 _ . : - 之一。');
+        // 规则与文案都取自 RoomName：它同时被对外契约文档（WsEventMarkdownRenderer）使用，
+        // 两处各写一份就会出现「文档说 64、实现只认 63」这种漂移。
+        if (! is_string($room) || ! RoomName::isValid($room)) {
+            throw new BusinessException(ErrorCode::INVALID_ARGUMENT, '房间名必须是 ' . RoomName::RULE . '。');
         }
 
         return $room;

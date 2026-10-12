@@ -51,11 +51,11 @@ final class WsIdleConnectionRecycleListener implements ListenerInterface
 
     public function process(object $event): void
     {
-        if ($this->started || ! (bool) $this->config->get('websocket.enabled', true)) {
+        if ($this->started || ! (bool) $this->config->get('websocket.enabled')) {
             return;
         }
 
-        $timeout = (int) $this->config->get('websocket.idle_timeout', 120);
+        $timeout = (int) $this->config->get('websocket.idle_timeout');
         if ($timeout <= 0) {
             return;
         }
@@ -66,7 +66,7 @@ final class WsIdleConnectionRecycleListener implements ListenerInterface
             return;
         }
 
-        $interval = max(1, (int) $this->config->get('websocket.idle_check_interval', 30));
+        $interval = max(1, (int) $this->config->get('websocket.idle_check_interval'));
         $this->started = true;
 
         Timer::tick($interval * 1000, function () use ($timeout): void {

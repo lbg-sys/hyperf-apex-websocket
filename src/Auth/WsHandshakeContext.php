@@ -30,4 +30,19 @@ final class WsHandshakeContext
 
         return $principal instanceof Principal ? $principal : null;
     }
+
+    /**
+     * 清掉中转身份，由入口在组装完 WsSession 之后调用。
+     *
+     * 这一层的值只服务于「握手中间件 → onOpen」这一跳：连接的身份此后由 WsSession 承载，
+     * 继续留在连接级 Context 里除了占位没有作用，还会让后来读它的人误以为身份来自握手。
+     *
+     * 置空而不是 ConnectionContext::destroy()：框架的 destroy() 用 `$container[$fd][$id]`
+     * 删键，而 set() 走的是点号路径写入（`{fd}.{id}` 展开成嵌套数组），
+     * 键里带点的 destroy() 根本删不到东西。
+     */
+    public static function clear(): void
+    {
+        ConnectionContext::set(self::CONTEXT_KEY, null);
+    }
 }

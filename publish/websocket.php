@@ -7,6 +7,10 @@ use function Hyperf\Support\env;
 /*
  * 通用 WebSocket 机制配置。
  *
+ * 本文件是「发布给应用的副本」：不发布也能跑，包内 ConfigProvider 已经给出同一套默认值
+ * （两者是否一致由 test/WebSocket/WsConfigDefaultsTest 断言）。发布之后这里就是生效值，
+ * 因为 Hyperf 按 array_merge_recursive(ConfigProvider 配置, config/autoload/*.php) 合并，后者覆盖前者。
+ *
  * 连接索引（Swoole\Table）是定长结构：容量与字符串列长度都必须在 fork 之前按峰值预留，
  * 写满之后 set() 只返回 false，溢出是静默丢数据。因此下面每一个容量项都不是「调优项」，
  * 而是「装不下就会丢连接」的硬边界。
@@ -18,8 +22,12 @@ return [
     // 入口路径前缀：所有 #[WsGateway] 的 path 必须落在它之下（启动期校验）。
     'path' => (string) env('WS_PATH', '/ws'),
 
-    // 单用户最大连接数（多端登录上限）。用户索引表按它预留字符串列长度，
-    // 超过上限的连接会被拒绝注册，而不是静默丢掉索引。
+    /*
+     * 单用户最大连接数（多端登录上限）。用户索引表按它预留字符串列长度，
+     * 超过上限的连接会被拒绝注册，而不是静默丢掉索引。
+     *
+     * 注意它会与连接 id（32 字节）相乘决定索引行宽：调大它会成倍增加共享内存占用。
+     */
     'max_connections_per_user' => (int) env('WS_MAX_CONN_PER_USER', 10),
 
     // 单连接最大房间数。
@@ -42,26 +50,58 @@ return [
         'max_messages' => (int) env('WS_RATE_LIMIT_MAX', 50),
     ],
 
-    // 连接索引表容量，按峰值连接数预留（ws_conn 与 ws_user 共用）。
+    /*
+     * 连接索引表容量（ws_conn 与 ws_user 共用）。
+     *
+     * 它是「主槽位数」而不是「能装下的连接数」的硬保证：Swoole\Table 会把行数向上取整到
+     * 2 的幂（最小 64），并且额外预留的 hash 冲突槽会先于主槽耗尽 —— 冲突槽用完后 set() 直接
+     * 返回 false（表现为新连接被拒绝）。按峰值再留余量设置。
+     */
     'table_size' => (int) env('WS_TABLE_SIZE', 65536),
 
-    // 单个房间的成员上限（ws_room 的字符串列长度）。
-    // 房间成员列表是「一个房间一行、行内放连接 id 列表」的定长结构，内存占用是
-    // 房间数 × 成员上限 的乘积，所以不能像连接表那样按峰值连接数预留，必须单独配置。
+    /*
+     * 单个房间的成员上限（房间索引行的列宽）。
+     *
+     * 房间成员列表是「一个房间一行、行内放连接 id 列表」的定长结构，内存占用是
+     * 房间数 × 成员上限 的乘积，所以不能像连接表那样按峰值连接数预留，必须单独配置。
+     */
     'room_member_capacity' => (int) env('WS_ROOM_MEMBER_CAPACITY', 128),
 
     // 房间索引表容量（能同时存在的房间数上限）。内存 ≈ 本值 × (room_member_capacity × 33) 字节。
     'room_table_size' => (int) env('WS_ROOM_TABLE_SIZE', 2048),
 
     /*
+     * 房间成员索引的存储后端。
+     *
+     * table：Swoole\Table 共享内存，单机内可见，零额外依赖、零网络开销 —— 单机部署选它。
+     * redis：成员集合放 Redis，跨节点可见 —— 「用户在 A 机、推送发起在 B 机」的横向扩容场景必须选它。
+     *        需要额外的 hyperf/redis（本包只把它写进 composer.json 的 suggest，没有硬依赖），
+     *        未安装时启动期检查会直接拦住。
+     *
+     * 只有房间索引可以切到 Redis：连接索引里的 fd 是单机概念，跨节点没有意义。
+     *
+     * Redis 驱动的一次订阅会操作两个键（members 与房间名索引），Redis Cluster 下两者必须
+     * 落在同一 slot；本实现没有加 hash tag，集群部署需要自行规划 prefix。
+     */
+    'room_store_driver' => (string) env('WS_ROOM_STORE_DRIVER', 'table'),
+
+    // Redis 房间索引使用的连接池名（对应 config/autoload/redis.php 里的池）。
+    'room_store_redis_pool' => (string) env('WS_ROOM_STORE_REDIS_POOL', 'default'),
+
+    // Redis 房间索引的键前缀。与其它组件共用同一套 Redis 时必须保证不冲突。
+    'room_store_prefix' => (string) env('WS_ROOM_STORE_PREFIX', 'core:wsroom:'),
+
+    /*
      * 空闲连接回收：超过本秒数没有收到任何消息的连接会被主动断开。
      *
      * 为什么必须有：网络中断（拔网线、进程被 kill、NAT 超时）不会触发 onClose，连接行会一直
-     * 挂在定长表里 —— 写满之后新连接注册直接失败、被拒，且不会自愈。协程服务器下 Swoole 的
-     * heartbeat 配置不生效（那是 Swoole\Server 的 settings），所以回收只能由应用层做。
+     * 挂在定长表里 —— 写满之后新连接注册直接失败、被拒，且不会自愈。
      *
-     * 客户端需要在本时限内定期发心跳（内置事件 sys.ping）。设为 0 表示关闭，
-     * 此时必须另有回收手段（如 Swoole 的 heartbeat_idle_time），否则启动期检查会直接失败。
+     * 协程服务器下 Swoole 的 heartbeat_idle_time 不生效（那是 Swoole\Server 的 settings，
+     * 协程服务器用的是 Swoole\Coroutine\Http\Server），所以只有传统 Hyperf\Server\Server
+     * 才能用心跳顶替这一项，否则必须开启本项，启动期检查会拦住「两项都为 0」的配置。
+     *
+     * 客户端需要在本时限内定期发心跳（内置事件 sys.ping）。
      */
     'idle_timeout' => (int) env('WS_IDLE_TIMEOUT', 180),
 

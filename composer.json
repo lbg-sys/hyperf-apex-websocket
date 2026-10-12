@@ -26,6 +26,9 @@
         "hyperf-apex/core": "^4.0",
         "hyperf/websocket-server": "^3.2"
     },
+    "suggest": {
+        "hyperf/redis": "把房间成员索引放到 Redis（websocket.room_store_driver=redis）时需要，用于跨节点共享房间成员；不设置该驱动时无需安装"
+    },
     "autoload": {
         "psr-4": {
             "Hyperf\\Apex\\WebSocket\\": "src/"

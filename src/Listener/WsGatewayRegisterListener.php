@@ -47,7 +47,7 @@ final class WsGatewayRegisterListener implements ListenerInterface
 
     public function process(object $event): void
     {
-        if (! (bool) $this->config->get('websocket.enabled', true)) {
+        if (! (bool) $this->config->get('websocket.enabled')) {
             return;
         }
 

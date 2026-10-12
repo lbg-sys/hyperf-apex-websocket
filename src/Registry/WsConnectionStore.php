@@ -6,52 +6,52 @@ namespace Hyperf\Apex\WebSocket\Registry;
 
 use Hyperf\Apex\WebSocket\Contract\WsConnectionStoreInterface;
 use Hyperf\Apex\WebSocket\Session\WsSession;
+use Hyperf\Apex\WebSocket\Support\TableLimits;
 use Hyperf\Contract\ConfigInterface;
 use RuntimeException;
 use Swoole\Table;
 use Throwable;
 
 /**
- * Swoole\Table 连接索引。
+ * 连接索引与用户索引的 Swoole\Table 实现。
  *
  * 为什么共享内存而不是 Redis：单点部署下跨节点问题不存在，引入 Redis 会让每条连接的
  * 建立与断开都多打一次 Redis，收益为零。限流场景否决 Swoole\Table 的理由（无 TTL、无 CAS、
  * key 空间无界）在这里都不成立：连接生命周期由 onOpen / onClose 显式管理，不需要 TTL，
  * key 空间受峰值连接数约束。
  *
+ * 房间索引不在这里 —— 房间成员是可能跨节点的一组 id，单独由 WsRoomStoreInterface 承载，
+ * 可选择 Swoole\Table 或 Redis 实现。
+ *
  * 表必须在 BeforeMainServerStart（master 进程、fork 之前）创建，否则每个 worker 各建各的，
  * 表之间不共享。
  *
- * 并发口径：用户索引与房间索引都是「一行放一串连接 id」，读改写不是原子的（Swoole\Table
- * 没有行锁）。单 worker 下协程不会在这两步之间切换，因此是安全的；跨 worker 并发注册同一
- * 用户时才存在丢 id 的窗口 —— 网关强制单 worker（Sender 在协程服务器下也无法跨 worker 投递），
+ * 并发口径：用户索引是「一行放一串连接 id」，读改写不是原子的。原因不是「Swoole\Table 没有锁」
+ * （单次 get/set 各自都带行级自旋锁），而是 get 与 set 之间锁已经释放，两个协程交错就会丢 id。
+ * 单 worker 下协程不会在纯内存操作之间切换，所以这里安全；跨 worker 并发注册同一用户时才存在
+ * 丢 id 的窗口 —— 网关强制单 worker（Sender 在协程服务器下也无法跨 worker 投递），
  * 该前提由 WsRuntimeCheckListener 在启动期守住。
  */
 final class WsConnectionStore implements WsConnectionStoreInterface
 {
-    /** `{server}:{fd}` 的字节上限，留足 32 字节。 */
-    private const CONNECTION_ID_BYTES = 32;
+    private const SEPARATOR = ',';
 
+    /** 接入端标识的列宽。超长会截断，而 connectionsByEndpoint() 拿的是未截断的值，等于永远匹配不上。 */
     private const ENDPOINT_BYTES = 32;
 
+    /**
+     * 用户类型的列宽。超长会截断，而 unregister() 是用行里的 user_type 重建用户索引键的 ——
+     * 截断后的键与原键不同，用户索引里那条记录就永远摘不掉。
+     */
     private const USER_TYPE_BYTES = 32;
 
     private const SESSION_ID_BYTES = 64;
-
-    private const SEPARATOR = ',';
-
-    /** Swoole\Table 单行上限 2M，留一半余量做配置错误拦截。 */
-    private const MAX_ROW_BYTES = 1048576;
 
     private static ?Table $connections = null;
 
     private static ?Table $users = null;
 
-    private static ?Table $rooms = null;
-
     private static int $userCapacity = 0;
-
-    private static int $roomCapacity = 0;
 
     /**
      * 创建共享内存表。重复调用是幂等的：BeforeMainServerStart 只会触发一次，
@@ -63,17 +63,13 @@ final class WsConnectionStore implements WsConnectionStoreInterface
             return;
         }
 
-        $size = max(1, (int) $config->get('websocket.table_size', 65536));
-        self::$userCapacity = max(1, (int) $config->get('websocket.max_connections_per_user', 10));
-        self::$roomCapacity = max(1, (int) $config->get('websocket.room_member_capacity', 128));
-        $roomSize = max(1, (int) $config->get('websocket.room_table_size', 2048));
+        $size = max(1, (int) $config->get('websocket.table_size'));
+        self::$userCapacity = max(1, (int) $config->get('websocket.max_connections_per_user'));
 
-        self::assertRowFits('websocket.max_connections_per_user', self::$userCapacity);
-        self::assertRowFits('websocket.room_member_capacity', self::$roomCapacity);
+        TableLimits::assertRowFits('websocket.max_connections_per_user', self::$userCapacity, self::itemBytes());
 
         self::$connections = self::createConnections($size);
-        self::$users = self::createIndex($size, self::$userCapacity);
-        self::$rooms = self::createIndex($roomSize, self::$roomCapacity);
+        self::$users = self::createIndex($size, self::rowBytes(self::$userCapacity));
     }
 
     public function register(WsSession $session): void
@@ -81,11 +77,23 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         $id = $session->id();
         $principal = $session->principal;
 
+        // 连接 id 既是连接表的键（键上限 63 字节），又是用户索引行里的值（列宽更小）。
+        // 这些字段超长都只会「警告 + 截断」，而不是报错，所以必须在写入前自己拦住：
+        // 截断后的连接 id 解析不出 fd，截断后的接入端标识再也匹配不上推送寻址。
+        // 可空身份：`??` 的左侧是 isset 语义，null 上的属性访问不会报警告，只是取到空值。
+        $userType = $principal->userType ?? '';
+        $sessionId = $principal->sessionId ?? '';
+
+        TableLimits::assertValue($id, TableLimits::CONNECTION_ID_BYTES, '连接 id');
+        TableLimits::assertValue($session->endpoint, self::ENDPOINT_BYTES, '接入端标识');
+        TableLimits::assertValue($userType, self::USER_TYPE_BYTES, '用户类型');
+        TableLimits::assertValue($sessionId, self::SESSION_ID_BYTES, '会话标识');
+
         self::write(self::connections(), $id, [
             'endpoint' => $session->endpoint,
-            'user_type' => $principal->userType ?? '',
+            'user_type' => $userType,
             'user_id' => $principal->userId ?? 0,
-            'session_id' => $principal->sessionId ?? '',
+            'session_id' => $sessionId,
             'connected_at' => $session->connectedAt,
             'last_active_at' => $session->connectedAt,
         ]);
@@ -94,15 +102,17 @@ final class WsConnectionStore implements WsConnectionStoreInterface
             return;
         }
 
+        $userKey = self::userKey($userType, $principal->userId);
+        TableLimits::assertKey($userKey, '用户索引键');
+
         try {
-            if ($this->append(self::users(), self::userKey($principal->userType, $principal->userId), $id, self::$userCapacity)) {
+            if ($this->append(self::users(), $userKey, $id, self::$userCapacity)) {
                 return;
             }
 
             throw new RuntimeException(sprintf(
-                '用户 %s:%d 的连接数超过上限 %d，拒绝写入连接索引。',
-                $principal->userType,
-                $principal->userId,
+                '用户 %s 的连接数超过上限 %d，拒绝写入连接索引。',
+                $userKey,
                 self::$userCapacity,
             ));
         } catch (Throwable $throwable) {
@@ -132,14 +142,15 @@ final class WsConnectionStore implements WsConnectionStoreInterface
 
     public function hasConnection(string $connectionId): bool
     {
-        return is_array(self::connections()->get($connectionId));
+        // exist() 只查哈希槽；get() 要把整行（含两个字符串列）拷出来，而这是每条推送路径上的判活。
+        return self::connections()->exist($connectionId);
     }
 
     public function touch(string $connectionId, int $activeAt): void
     {
         // 只写一列：Swoole\Table::set 对已存在的行是部分更新，不会覆盖其余列。
         // 行已经不存在时 set 会新建一行残行，所以先确认连接还在。
-        if (! is_array(self::connections()->get($connectionId))) {
+        if (! self::connections()->exist($connectionId)) {
             return;
         }
 
@@ -171,11 +182,6 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         return $this->ids(self::users(), self::userKey($userType, $userId));
     }
 
-    public function connectionsByRoom(string $room): array
-    {
-        return $this->ids(self::rooms(), $room);
-    }
-
     /**
      * 接入端连接列表由连接行过滤得出，不单独维护反向索引。
      *
@@ -198,6 +204,10 @@ final class WsConnectionStore implements WsConnectionStoreInterface
     {
         $ids = [];
         foreach (self::connections() as $key => $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
             $ids[] = (string) $key;
         }
 
@@ -214,23 +224,17 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         return self::users()->count();
     }
 
-    public function countRooms(): int
+    /**
+     * 行内每个连接 id 占用的字节数：id 本身加一个分隔符。
+     */
+    private static function itemBytes(): int
     {
-        return self::rooms()->count();
+        return TableLimits::CONNECTION_ID_BYTES + 1;
     }
 
-    public function joinRoom(string $connectionId, string $room): bool
+    private static function rowBytes(int $capacity): int
     {
-        if (! is_array(self::connections()->get($connectionId))) {
-            throw new RuntimeException(sprintf('连接 %s 未注册，无法加入房间 %s。', $connectionId, $room));
-        }
-
-        return $this->append(self::rooms(), $room, $connectionId, self::$roomCapacity);
-    }
-
-    public function leaveRoom(string $connectionId, string $room): void
-    {
-        $this->remove(self::rooms(), $room, $connectionId);
+        return $capacity * self::itemBytes() + 1;
     }
 
     private static function createConnections(int $size): Table
@@ -249,35 +253,15 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         return $table;
     }
 
-    private static function createIndex(int $size, int $capacity): Table
+    private static function createIndex(int $size, int $bytes): Table
     {
         $table = new Table($size);
-        $table->column('connections', Table::TYPE_STRING, self::rowBytes($capacity));
+        $table->column('connections', Table::TYPE_STRING, $bytes);
         if (! $table->create()) {
             throw new RuntimeException('无法创建 WebSocket 索引表。');
         }
 
         return $table;
-    }
-
-    /**
-     * 定长表必须按峰值预留：写满后 set() 只返回 false，溢出是静默丢数据。
-     * 因此这里宁可让配置本身失败，也不接受「悄悄少记一个连接」。
-     */
-    private static function assertRowFits(string $path, int $capacity): void
-    {
-        if (self::rowBytes($capacity) > self::MAX_ROW_BYTES) {
-            throw new RuntimeException(sprintf(
-                '%s=%d 会让索引列超过 Swoole\Table 的单行上限，请调小该值或用更小的连接 id。',
-                $path,
-                $capacity,
-            ));
-        }
-    }
-
-    private static function rowBytes(int $capacity): int
-    {
-        return $capacity * (self::CONNECTION_ID_BYTES + 1) + 1;
     }
 
     private static function userKey(string $userType, int $userId): string
@@ -295,18 +279,16 @@ final class WsConnectionStore implements WsConnectionStoreInterface
         return self::$users ?? throw new RuntimeException('WebSocket 用户索引尚未初始化，请确认已注册 WsTableInitListener。');
     }
 
-    private static function rooms(): Table
-    {
-        return self::$rooms ?? throw new RuntimeException('WebSocket 房间索引尚未初始化，请确认已注册 WsTableInitListener。');
-    }
-
     /**
      * @param array<string, int|string> $row
      */
     private static function write(Table $table, string $key, array $row): void
     {
         if ($table->set($key, $row) === false) {
-            throw new RuntimeException(sprintf('WebSocket 索引写入失败（键 %s）：表容量已满或键／值超出列长度。', $key));
+            throw new RuntimeException(sprintf(
+                'WebSocket 索引写入失败（键 %s）：表容量已满（Swoole\Table 的冲突槽会先于主槽耗尽）或键／值超出列长度。',
+                $key,
+            ));
         }
     }
 

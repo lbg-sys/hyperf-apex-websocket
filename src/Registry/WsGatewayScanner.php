@@ -12,6 +12,7 @@ use Hyperf\Contract\OnCloseInterface;
 use Hyperf\Contract\OnMessageInterface;
 use Hyperf\Contract\OnOpenInterface;
 use Hyperf\Di\Annotation\AnnotationCollector;
+use Hyperf\Server\ServerInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use ReflectionClass;
 
@@ -33,6 +34,11 @@ final class WsGatewayScanner
     /**
      * 全部入口定义，键为入口类名。
      *
+     * 「一个入口都没有」不是错误：通过元包安装、但根本不用长连接的应用（server.php 里没有
+     * WebSocket 服务）不该因此起不来。真正该拦的是「配了 WebSocket 服务却没有入口」——
+     * 那种情况客户端握手只会拿到 404，由 WsDeclarationCheckListener 在能读到 server 配置的
+     * 地方判定（它才需要回答「这个应用到底用不用长连接」）。
+     *
      * @return array<class-string, WsGatewayDefinition>
      *
      * @throws WsDeclarationException 任意一项声明校验不通过
@@ -44,14 +50,9 @@ final class WsGatewayScanner
         }
 
         $collected = AnnotationCollector::getClassesByAnnotation(WsGateway::class);
-        if ($collected === []) {
-            throw new WsDeclarationException([
-                '至少需要一个 #[WsGateway] 入口：否则配置了 ws 服务也没有任何路径可以握手。',
-            ]);
-        }
 
-        $servers = $this->declaredServers();
-        $prefix = trim((string) $this->config->get('websocket.path', ''), '/');
+        $servers = $this->webSocketServers();
+        $prefix = trim((string) $this->config->get('websocket.path'), '/');
         $errors = [];
         $paths = [];
         $endpoints = [];
@@ -98,6 +99,38 @@ final class WsGatewayScanner
         return self::definition($class, $annotation);
     }
 
+    /**
+     * config/autoload/server.php 里声明的 WebSocket 服务名。
+     *
+     * 只认 type === SERVER_WEBSOCKET 的端口：握手回调（onHandShake）只挂在 WebSocket 服务上，
+     * 而「名字存在」是很弱的校验 —— 注解里写成 http 端口一样能通过，结果客户端握手 404。
+     *
+     * 这一项最有价值：把「注解写了 ws 但 server.php 没配这个服务」挡在启动期。
+     *
+     * @return list<string>
+     */
+    public function webSocketServers(): array
+    {
+        $servers = $this->config->get('server.servers', []);
+        if (! is_array($servers)) {
+            return [];
+        }
+
+        $names = [];
+        foreach ($servers as $server) {
+            if (! is_array($server)) {
+                continue;
+            }
+
+            $name = $server['name'] ?? null;
+            if (is_string($name) && $name !== '' && ($server['type'] ?? null) === ServerInterface::SERVER_WEBSOCKET) {
+                $names[] = $name;
+            }
+        }
+
+        return $names;
+    }
+
     private static function definition(string $class, WsGateway $annotation): WsGatewayDefinition
     {
         return new WsGatewayDefinition(
@@ -135,7 +168,8 @@ final class WsGatewayScanner
 
         if (! in_array($definition->server, $servers, true)) {
             $errors[] = sprintf(
-                '%s 声明的 server「%s」在 config/autoload/server.php 里不存在，已声明：%s。',
+                '%s 声明的 server「%s」在 config/autoload/server.php 里不存在，或不是 WebSocket 服务（type 需为 SERVER_WEBSOCKET）。'
+                . '已声明的 WebSocket 服务：%s。',
                 $definition->class,
                 $definition->server,
                 $servers === [] ? '（无）' : implode(', ', $servers),
@@ -213,30 +247,5 @@ final class WsGatewayScanner
         $root = '/' . $prefix;
 
         return $path === $root || str_starts_with($path, $root . '/');
-    }
-
-    /**
-     * config/autoload/server.php 里声明的 server 名。
-     *
-     * 这一项最有价值：把「注解写了 ws 但 server.php 没配这个服务」挡在启动期，
-     * 而不是让客户端在握手时收到 404。
-     *
-     * @return list<string>
-     */
-    private function declaredServers(): array
-    {
-        $servers = $this->config->get('server.servers', []);
-        if (! is_array($servers)) {
-            return [];
-        }
-
-        $names = [];
-        foreach ($servers as $server) {
-            if (is_array($server) && isset($server['name']) && is_string($server['name']) && $server['name'] !== '') {
-                $names[] = $server['name'];
-            }
-        }
-
-        return $names;
     }
 }
