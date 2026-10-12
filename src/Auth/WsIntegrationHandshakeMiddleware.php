@@ -13,13 +13,13 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 
 /**
- * 设备端握手鉴权：集成 token，比对 config('integration.integration_token')。
+ * 集成凭证握手鉴权：集成 token，比对 config('integration.integration_token')。
  *
  * 与 IntegrationTokenMiddleware 同一套判据，只是 token 的来源不同：浏览器 WebSocket API
  * 无法自定义请求头，所以 token 只能走 query 或 Sec-WebSocket-Protocol，不能走 header。
  *
  * 校验通过不写入 Principal：集成 token 标识的是「接入方」而不是某个用户，
- * 设备端连接因此没有用户身份，推送寻址用 endpoint / room。
+ * 该连接因此没有用户身份，推送寻址用 endpoint / room。
  */
 final class WsIntegrationHandshakeMiddleware extends AbstractMiddleware
 {

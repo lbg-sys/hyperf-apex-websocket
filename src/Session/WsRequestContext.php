@@ -23,7 +23,7 @@ final readonly class WsRequestContext
     }
 
     /**
-     * 设备端用集成 token 接入，没有用户身份，返回 null。
+     * 用集成凭证接入的连接没有用户身份，返回 null。
      */
     public function principal(): ?Principal
     {

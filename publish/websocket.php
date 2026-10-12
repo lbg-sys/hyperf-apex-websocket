@@ -40,7 +40,7 @@ return [
     'room_table_size' => (int) env('WS_ROOM_TABLE_SIZE', 2048),
 
     /*
-     * 测试入口开关（App\Module\Test 下的 /ws/test）。
+     * 本地人工测试入口开关（例如应用自建的 /ws/test 探针）。
      *
      * 该入口不做身份校验，所以默认关闭，本地人工测试时显式打开：WS_TEST_ENTRY_ENABLED=true。
      *
@@ -48,7 +48,7 @@ return [
      * 于是一次「忘了设环境变量」的部署就把无鉴权入口对外开了。安全默认值不能依赖别的变量
      * 是否被正确设置。
      *
-     * app/Module/Test/ 被 .gitignore 排除（模块定位是「本地人工测试工具」），
+     * 探针入口由应用自行提供并排除在版本管理外（定位是「本地人工测试工具」），
      * 所以仓库里看不到读这个键的中间件 —— 本地把探针放回去即可生效。
      */
     'test_entry_enabled' => (bool) env('WS_TEST_ENTRY_ENABLED', false),
@@ -56,13 +56,12 @@ return [
     /*
      * 不进对外契约的入口类与事件处理器类，支持 * 通配（与 api_doc.excluded 同一套匹配语义）。
      *
-     * 只影响两份对外文档：Apifox 文档（api-doc:generate-apifox）与
-     * docs/websocket-protocol.md（test/WebSocket/DocConsistencyTest.php 的锚点校验）。
+     * 只影响对外契约文档（Apifox 文档，api-doc:generate-apifox）。
      * **不影响路由注册**：列在这里的入口照样可以连接，只是不出现在对外文档里。
      *
-     * 目前登记的 App\Module\Test 同样不进版本管理；将来新增内部 / 调试入口，在这里补一条即可。
+     * 应用自己的内部 / 调试入口不进版本管理；将来新增这类入口，在这里补一条即可。
      */
     'excluded' => [
-        // 'App\Controller\Test\*',
+        // 'App\Controller\Internal\*',
     ],
 ];
