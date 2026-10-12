@@ -23,7 +23,7 @@
     ],
     "require": {
         "php": ">=8.4",
-        "hyperf-apex/core": "^4.0",
+        "hyperf-apex/core": "^0.1",
         "hyperf/websocket-server": "^3.2"
     },
     "suggest": {
@@ -36,8 +36,8 @@
     },
     "extra": {
         "branch-alias": {
-            "dev-master": "4.0.x-dev",
-            "dev-main": "4.0.x-dev"
+            "dev-master": "0.1.x-dev",
+            "dev-main": "0.1.x-dev"
         },
         "hyperf": {
             "config": "Hyperf\\Apex\\WebSocket\\ConfigProvider"
